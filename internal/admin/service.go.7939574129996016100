@@ -1,0 +1,825 @@
+package admin
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/json"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+	"golang.org/x/crypto/bcrypt"
+
+	"s3store/backend/internal/config"
+	"s3store/backend/internal/meta"
+	"s3store/backend/internal/redisx"
+	"s3store/backend/internal/storage"
+	"s3store/backend/internal/types"
+)
+
+type Service struct {
+	repo   meta.Repository
+	store  storage.Backend
+	cache  *redisx.Client
+	cfg    config.Config
+	logger *slog.Logger
+}
+
+func NewService(repo meta.Repository, store storage.Backend, cache *redisx.Client, cfg config.Config, logger *slog.Logger) *Service {
+	return &Service{repo: repo, store: store, cache: cache, cfg: cfg, logger: logger}
+}
+
+func (s *Service) SeedRootAdmin(ctx context.Context) error {
+	if strings.TrimSpace(s.cfg.RootAdminEmail) == "" || s.cfg.RootAdminPassword == "" {
+		return errors.New("ROOT_ADMIN_EMAIL and ROOT_ADMIN_PASSWORD are required")
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(s.cfg.RootAdminPassword), bcrypt.DefaultCost)
+	if err != nil {
+		return err
+	}
+	if err := s.repo.UpsertAdminUser(ctx, meta.AdminUser{
+		Email:        strings.TrimSpace(s.cfg.RootAdminEmail),
+		PasswordHash: string(hash),
+		Role:         "root",
+	}); err != nil {
+		return err
+	}
+	_ = s.repo.AddAudit(ctx, s.cfg.RootAdminEmail, "SeedAdmin", "admin", "success")
+	s.logger.Info("root admin seeded", "email", s.cfg.RootAdminEmail)
+	return nil
+}
+
+func (s *Service) Router() http.Handler {
+	r := chi.NewRouter()
+	r.Use(cors)
+	r.Get("/healthz", s.healthz)
+	r.Route("/api", func(r chi.Router) {
+		r.Post("/auth/login", s.login)
+		r.Post("/auth/logout", s.logout)
+		r.Group(func(r chi.Router) {
+			r.Use(s.requireSession)
+			r.Get("/auth/me", s.me)
+			r.Get("/dashboard", s.dashboard)
+			r.Get("/buckets", s.listBuckets)
+			r.Post("/buckets", s.createBucket)
+			r.Put("/buckets/{bucket}", s.renameBucket)
+			r.Delete("/buckets/{bucket}", s.deleteBucket)
+			r.Get("/buckets/{bucket}/objects", s.listObjects)
+			r.Post("/buckets/{bucket}/objects/upload", s.uploadObject)
+			r.Post("/buckets/{bucket}/objects/hls", s.prepareObjectHLS)
+			r.Get("/buckets/{bucket}/objects/hls/status", s.objectHLSStatus)
+			r.Get("/buckets/{bucket}/objects/download", s.downloadObject)
+			r.Delete("/buckets/{bucket}/objects", s.deleteObject)
+			r.Get("/streams", s.listStreams)
+			r.Post("/streams", s.createStream)
+			r.Get("/streams/{id}", s.getStream)
+			r.Get("/streams/{id}/segments", s.listSegments)
+			r.Get("/streams/{id}/playlist.m3u8", s.playlist)
+			r.Get("/storage/health", s.storageHealth)
+			r.Get("/usage/summary", s.usageSummary)
+			r.Get("/audit-logs", s.auditLogs)
+			r.Get("/quotas", s.quotas)
+			r.Put("/quotas", s.saveQuotas)
+		})
+	})
+	r.Head("/{bucket}/.hls/{assetID}/*", s.hlsAsset)
+	r.Get("/{bucket}/.hls/{assetID}/*", s.hlsAsset)
+	r.Head("/{bucket}/*", s.publicObject)
+	r.Get("/{bucket}/*", s.publicObject)
+	return r
+}
+
+func cors(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+		if origin != "" {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Vary", "Origin")
+			w.Header().Set("Access-Control-Allow-Credentials", "true")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Range")
+			w.Header().Set("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS")
+			w.Header().Set("Access-Control-Expose-Headers", "Accept-Ranges, Content-Range, Content-Length, Content-Type, ETag")
+		}
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (s *Service) login(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Email    string `json:"email"`
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	req.Email = strings.TrimSpace(req.Email)
+	user, err := s.repo.GetAdminUserByEmail(r.Context(), req.Email)
+	if err != nil || bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(req.Password)) != nil {
+		writeJSONError(w, http.StatusUnauthorized, "invalid email or password")
+		return
+	}
+	sessionID := randomSessionID()
+	s.cache.Set(r.Context(), "session:"+sessionID, user.Email, 24*time.Hour)
+	http.SetCookie(w, &http.Cookie{Name: "s3store_session", Value: sessionID, Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode, MaxAge: 86400})
+	_ = s.repo.AddAudit(r.Context(), user.Email, "Login", "admin", "success")
+	writeJSON(w, http.StatusOK, map[string]any{"email": user.Email, "role": user.Role})
+}
+
+func (s *Service) logout(w http.ResponseWriter, r *http.Request) {
+	if c, err := r.Cookie("s3store_session"); err == nil {
+		s.cache.Del(r.Context(), "session:"+c.Value)
+	}
+	http.SetCookie(w, &http.Cookie{Name: "s3store_session", Value: "", Path: "/", HttpOnly: true, MaxAge: -1})
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Service) requireSession(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := r.Cookie("s3store_session")
+		if err != nil || c.Value == "" {
+			writeJSONError(w, http.StatusUnauthorized, "login required")
+			return
+		}
+		if _, ok := s.cache.Get(r.Context(), "session:"+c.Value); !ok {
+			writeJSONError(w, http.StatusUnauthorized, "session expired")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (s *Service) me(w http.ResponseWriter, r *http.Request) {
+	c, _ := r.Cookie("s3store_session")
+	email, _ := s.cache.Get(r.Context(), "session:"+c.Value)
+	user, err := s.repo.GetAdminUserByEmail(r.Context(), email)
+	if err != nil {
+		writeJSONError(w, http.StatusUnauthorized, "session user not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"email": user.Email, "role": user.Role})
+}
+
+func (s *Service) dashboard(w http.ResponseWriter, r *http.Request) {
+	usage, _ := s.repo.UsageSummary(r.Context())
+	health := s.healthSnapshot(r)
+	audit, _ := s.repo.ListAudit(r.Context(), 8)
+	writeJSON(w, http.StatusOK, map[string]any{"usage": usage, "health": health, "audit": audit})
+}
+
+func (s *Service) listBuckets(w http.ResponseWriter, r *http.Request) {
+	buckets, err := s.repo.ListBuckets(r.Context())
+	if err != nil {
+		writeJSONError(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, buckets)
+}
+
+func (s *Service) createBucket(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Name   string `json:"name"`
+		Policy string `json:"policy"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Name == "" {
+		writeJSONError(w, http.StatusBadRequest, "bucket name is required")
+		return
+	}
+	b, err := s.repo.CreateBucket(r.Context(), strings.TrimSpace(req.Name), normalizeBucketPolicy(req.Policy))
+	if err != nil {
+		writeJSONError(w, mapStatus(err), err.Error())
+		return
+	}
+	_ = s.repo.AddAudit(r.Context(), "admin", "CreateBucket", req.Name, "success")
+	writeJSON(w, http.StatusCreated, b)
+}
+
+func (s *Service) renameBucket(w http.ResponseWriter, r *http.Request) {
+	oldName := chi.URLParam(r, "bucket")
+	var req struct {
+		Name   string `json:"name"`
+		Policy string `json:"policy"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || strings.TrimSpace(req.Name) == "" {
+		writeJSONError(w, http.StatusBadRequest, "new bucket name is required")
+		return
+	}
+	newName := strings.TrimSpace(req.Name)
+	if oldName != newName {
+		if err := s.store.RenameBucket(r.Context(), oldName, newName); err != nil {
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
+	b, err := s.repo.UpdateBucket(r.Context(), oldName, newName, normalizeBucketPolicy(req.Policy))
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	_ = s.repo.AddAudit(r.Context(), "admin", "UpdateBucket", oldName+" -> "+newName, "success")
+	writeJSON(w, http.StatusOK, b)
+}
+
+func (s *Service) deleteBucket(w http.ResponseWriter, r *http.Request) {
+	bucket := chi.URLParam(r, "bucket")
+	if r.URL.Query().Get("force") == "1" || r.URL.Query().Get("recursive") == "1" {
+		if err := s.store.DeleteBucket(r.Context(), bucket); err != nil {
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if err := s.repo.DeleteBucketRecursive(r.Context(), bucket); err != nil {
+			writeJSONError(w, mapStatus(err), err.Error())
+			return
+		}
+		_ = s.repo.AddAudit(r.Context(), "admin", "DeleteBucketRecursive", bucket, "success")
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if err := s.repo.DeleteBucket(r.Context(), bucket); err != nil {
+		writeJSONError(w, mapStatus(err), err.Error())
+		return
+	}
+	_ = s.store.DeleteBucket(r.Context(), bucket)
+	_ = s.repo.AddAudit(r.Context(), "admin", "DeleteBucket", bucket, "success")
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Service) listObjects(w http.ResponseWriter, r *http.Request) {
+	bucket := chi.URLParam(r, "bucket")
+	prefix := r.URL.Query().Get("prefix")
+	cursor := r.URL.Query().Get("cursor")
+	limit := intQuery(r, "limit", 100)
+	objects, next, err := s.repo.ListObjects(r.Context(), bucket, prefix, limit, cursor)
+	if err != nil {
+		writeJSONError(w, mapStatus(err), err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": objects, "nextCursor": next})
+}
+
+func (s *Service) uploadObject(w http.ResponseWriter, r *http.Request) {
+	bucket := chi.URLParam(r, "bucket")
+	key := r.URL.Query().Get("key")
+	if key == "" {
+		writeJSONError(w, http.StatusBadRequest, "key is required")
+		return
+	}
+	stored, err := s.store.Put(r.Context(), storage.ObjectWrite{Bucket: bucket, Key: key, ContentType: r.Header.Get("Content-Type"), Body: r.Body})
+	if err != nil {
+		writeJSONError(w, 500, err.Error())
+		return
+	}
+	obj := types.Object{Bucket: bucket, Key: key, Size: stored.Size, ETag: stored.ETag, ContentType: stored.ContentType, StorageBackend: stored.StorageBackend, PhysicalPath: stored.PhysicalPath}
+	if err := s.repo.UpsertObject(r.Context(), obj); err != nil {
+		writeJSONError(w, mapStatus(err), err.Error())
+		return
+	}
+	if isVideoObject(obj) {
+		go s.prepareHLSBackground(bucket, key)
+	}
+	writeJSON(w, http.StatusCreated, obj)
+}
+
+func (s *Service) objectHLSStatus(w http.ResponseWriter, r *http.Request) {
+	bucket := chi.URLParam(r, "bucket")
+	key := r.URL.Query().Get("key")
+	if key == "" {
+		writeJSONError(w, http.StatusBadRequest, "key is required")
+		return
+	}
+	obj, err := s.repo.GetObject(r.Context(), bucket, key)
+	if err != nil {
+		writeJSONError(w, mapStatus(err), err.Error())
+		return
+	}
+	available := s.hlsReady(bucket, key)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"available":   available,
+		"playlistUrl": s.hlsPlaylistURL(r, bucket, key),
+		"video":       isVideoObject(obj),
+	})
+}
+
+func (s *Service) prepareObjectHLS(w http.ResponseWriter, r *http.Request) {
+	bucket := chi.URLParam(r, "bucket")
+	key := r.URL.Query().Get("key")
+	if key == "" {
+		writeJSONError(w, http.StatusBadRequest, "key is required")
+		return
+	}
+	obj, err := s.repo.GetObject(r.Context(), bucket, key)
+	if err != nil {
+		writeJSONError(w, mapStatus(err), err.Error())
+		return
+	}
+	if !isVideoObject(obj) {
+		writeJSONError(w, http.StatusBadRequest, "HLS is only available for video objects")
+		return
+	}
+	if err := s.generateHLS(r.Context(), bucket, key, obj); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"available":   true,
+		"playlistUrl": s.hlsPlaylistURL(r, bucket, key),
+	})
+}
+
+func (s *Service) prepareHLSBackground(bucket, key string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Hour)
+	defer cancel()
+	obj, err := s.repo.GetObject(ctx, bucket, key)
+	if err != nil || !isVideoObject(obj) {
+		return
+	}
+	if err := s.generateHLS(ctx, bucket, key, obj); err != nil {
+		s.logger.Warn("hls generation failed", "bucket", bucket, "key", key, "error", err)
+	}
+}
+
+func (s *Service) generateHLS(ctx context.Context, bucket, key string, obj types.Object) error {
+	if obj.PhysicalPath == "" {
+		return errors.New("object is not stored on local disk; HLS preparation is unavailable")
+	}
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		return errors.New("ffmpeg is required for HLS preparation; install ffmpeg and restart the backend")
+	}
+	if _, err := os.Stat(obj.PhysicalPath); err != nil {
+		return fmt.Errorf("source object is not readable: %w", err)
+	}
+	dir, err := s.hlsDir(bucket, key)
+	if err != nil {
+		return err
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	playlist := filepath.Join(dir, "playlist.m3u8")
+	segmentPattern := filepath.Join(dir, "segment_%05d.m4s")
+	cmd := exec.CommandContext(ctx, "ffmpeg",
+		"-hide_banner",
+		"-loglevel", "error",
+		"-y",
+		"-i", obj.PhysicalPath,
+		"-map", "0",
+		"-c", "copy",
+		"-f", "hls",
+		"-hls_time", "2",
+		"-hls_list_size", "0",
+		"-hls_playlist_type", "vod",
+		"-hls_segment_type", "fmp4",
+		"-hls_fmp4_init_filename", "init.mp4",
+		"-hls_segment_filename", segmentPattern,
+		playlist,
+	)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("ffmpeg failed: %s", strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+func (s *Service) downloadObject(w http.ResponseWriter, r *http.Request) {
+	bucket := chi.URLParam(r, "bucket")
+	key := r.URL.Query().Get("key")
+	obj, err := s.repo.GetObject(r.Context(), bucket, key)
+	if err != nil {
+		writeJSONError(w, mapStatus(err), err.Error())
+		return
+	}
+	reader, _, err := s.store.Get(r.Context(), bucket, key, nil)
+	if err != nil {
+		writeJSONError(w, 404, err.Error())
+		return
+	}
+	defer reader.Close()
+	w.Header().Set("Content-Type", obj.ContentType)
+	w.Header().Set("Content-Length", strconv.FormatInt(obj.Size, 10))
+	disposition := "attachment"
+	if r.URL.Query().Get("inline") == "1" {
+		disposition = "inline"
+	}
+	w.Header().Set("Content-Disposition", disposition+`; filename="`+safeFilename(key)+`"`)
+	_, _ = io.Copy(w, reader)
+}
+
+func (s *Service) publicObject(w http.ResponseWriter, r *http.Request) {
+	bucket := chi.URLParam(r, "bucket")
+	key, obj, err := s.publicObjectLookup(r, bucket)
+	if err != nil {
+		writeJSONError(w, mapStatus(err), err.Error())
+		return
+	}
+	if servePhysicalObject(w, r, obj, key, `inline; filename="`+safeFilename(key)+`"`, true) {
+		return
+	}
+	rangeSpec, partial := storage.ParseRange(r.Header.Get("Range"), obj.Size)
+	reader, _, err := s.store.Get(r.Context(), bucket, key, rangeSpec)
+	if err != nil {
+		writeJSONError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	defer reader.Close()
+	w.Header().Set("Content-Type", publicContentType(obj))
+	w.Header().Set("ETag", `"`+obj.ETag+`"`)
+	w.Header().Set("Accept-Ranges", "bytes")
+	w.Header().Set("Cache-Control", "public, max-age=3600")
+	w.Header().Set("Content-Disposition", `inline; filename="`+safeFilename(key)+`"`)
+	if partial {
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", rangeSpec.Start, rangeSpec.End, obj.Size))
+		w.Header().Set("Content-Length", strconv.FormatInt(rangeSpec.End-rangeSpec.Start+1, 10))
+		w.WriteHeader(http.StatusPartialContent)
+	} else {
+		w.Header().Set("Content-Length", strconv.FormatInt(obj.Size, 10))
+	}
+	if r.Method == http.MethodHead {
+		return
+	}
+	_, _ = io.Copy(w, reader)
+}
+
+func servePhysicalObject(w http.ResponseWriter, r *http.Request, obj types.Object, filename, disposition string, cache bool) bool {
+	if obj.PhysicalPath == "" {
+		return false
+	}
+	file, err := os.Open(obj.PhysicalPath)
+	if err != nil {
+		return false
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil || info.IsDir() {
+		return false
+	}
+	w.Header().Set("Content-Type", publicContentType(obj))
+	w.Header().Set("ETag", `"`+obj.ETag+`"`)
+	w.Header().Set("Accept-Ranges", "bytes")
+	w.Header().Set("Content-Disposition", disposition)
+	if cache {
+		w.Header().Set("Cache-Control", "public, max-age=3600")
+	}
+	http.ServeContent(w, r, filename, info.ModTime(), file)
+	return true
+}
+
+func (s *Service) hlsAsset(w http.ResponseWriter, r *http.Request) {
+	bucket := chi.URLParam(r, "bucket")
+	assetID := chi.URLParam(r, "assetID")
+	name := chi.URLParam(r, "*")
+	if name == "" {
+		name = "playlist.m3u8"
+	}
+	path, err := safeJoin(s.cfg.HLSDataRoot, filepath.Join(bucket, assetID, filepath.FromSlash(name)))
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if strings.HasSuffix(name, ".m3u8") {
+		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+		w.Header().Set("Cache-Control", "no-cache")
+	} else if strings.HasSuffix(name, ".m4s") {
+		w.Header().Set("Content-Type", "video/iso.segment")
+		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	} else if strings.HasSuffix(name, ".mp4") {
+		w.Header().Set("Content-Type", "video/mp4")
+		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	}
+	http.ServeFile(w, r, path)
+}
+
+func (s *Service) hlsReady(bucket, key string) bool {
+	dir, err := s.hlsDir(bucket, key)
+	if err != nil {
+		return false
+	}
+	info, err := os.Stat(filepath.Join(dir, "playlist.m3u8"))
+	return err == nil && !info.IsDir()
+}
+
+func (s *Service) hlsPlaylistURL(r *http.Request, bucket, key string) string {
+	scheme := "http"
+	if r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") {
+		scheme = "https"
+	}
+	return fmt.Sprintf("%s://%s/%s/.hls/%s/playlist.m3u8", scheme, r.Host, url.PathEscape(bucket), s.hlsID(bucket, key))
+}
+
+func (s *Service) hlsDir(bucket, key string) (string, error) {
+	return safeJoin(s.cfg.HLSDataRoot, filepath.Join(bucket, s.hlsID(bucket, key)))
+}
+
+func (s *Service) hlsID(bucket, key string) string {
+	sum := sha256.Sum256([]byte(bucket + "\x00" + key))
+	return hex.EncodeToString(sum[:])[:32]
+}
+
+func isVideoObject(obj types.Object) bool {
+	contentType := strings.ToLower(obj.ContentType)
+	key := strings.ToLower(obj.Key)
+	return strings.HasPrefix(contentType, "video/") || strings.HasSuffix(key, ".mp4") || strings.HasSuffix(key, ".webm")
+}
+
+func safeJoin(root, child string) (string, error) {
+	cleanRoot, err := filepath.Abs(root)
+	if err != nil {
+		return "", err
+	}
+	cleanPath, err := filepath.Abs(filepath.Join(cleanRoot, child))
+	if err != nil {
+		return "", err
+	}
+	if cleanPath != cleanRoot && !strings.HasPrefix(cleanPath, cleanRoot+string(os.PathSeparator)) {
+		return "", errors.New("path escapes root")
+	}
+	return cleanPath, nil
+}
+
+func (s *Service) publicObjectLookup(r *http.Request, bucket string) (string, types.Object, error) {
+	candidates := []string{chi.URLParam(r, "*")}
+	escapedPrefix := "/" + url.PathEscape(bucket) + "/"
+	plainPrefix := "/" + bucket + "/"
+	for _, prefix := range []string{escapedPrefix, plainPrefix} {
+		if raw, ok := strings.CutPrefix(r.URL.EscapedPath(), prefix); ok {
+			candidates = append(candidates, raw)
+		}
+	}
+	var lastErr error
+	seen := map[string]bool{}
+	for _, candidate := range candidates {
+		for _, key := range publicObjectKeyVariants(candidate) {
+			if key == "" || seen[key] {
+				continue
+			}
+			seen[key] = true
+			obj, err := s.repo.GetObject(r.Context(), bucket, key)
+			if err == nil {
+				return key, obj, nil
+			}
+			lastErr = err
+		}
+	}
+	if key, obj, ok := s.findPublicObjectByNormalizedKey(r, bucket, candidates); ok {
+		return key, obj, nil
+	}
+	if lastErr == nil {
+		lastErr = meta.ErrObjectNotFound
+	}
+	return candidates[0], types.Object{}, lastErr
+}
+
+func publicObjectKeyVariants(key string) []string {
+	variants := []string{key}
+	if decoded, err := url.PathUnescape(key); err == nil {
+		variants = append(variants, decoded)
+	}
+	if decoded, err := url.QueryUnescape(key); err == nil {
+		variants = append(variants, decoded)
+	}
+	variants = append(variants, strings.ReplaceAll(key, "+", " "))
+	return variants
+}
+
+func (s *Service) findPublicObjectByNormalizedKey(r *http.Request, bucket string, candidates []string) (string, types.Object, bool) {
+	targets := map[string]bool{}
+	for _, candidate := range candidates {
+		for _, variant := range publicObjectKeyVariants(candidate) {
+			targets[normalizeObjectKeyForLookup(variant)] = true
+		}
+	}
+	objects, _, err := s.repo.ListObjects(r.Context(), bucket, "", 1000, "")
+	if err != nil {
+		return "", types.Object{}, false
+	}
+	for _, obj := range objects {
+		if targets[normalizeObjectKeyForLookup(obj.Key)] {
+			return obj.Key, obj, true
+		}
+	}
+	return "", types.Object{}, false
+}
+
+func normalizeObjectKeyForLookup(key string) string {
+	key = strings.TrimSpace(key)
+	key = strings.ReplaceAll(key, "+", " ")
+	return strings.Join(strings.Fields(key), " ")
+}
+
+func publicContentType(obj types.Object) string {
+	contentType := obj.ContentType
+	if contentType == "" || contentType == "application/octet-stream" {
+		lower := strings.ToLower(obj.Key)
+		switch {
+		case strings.HasSuffix(lower, ".pdf"):
+			return "application/pdf"
+		case strings.HasSuffix(lower, ".mp4"):
+			return "video/mp4"
+		case strings.HasSuffix(lower, ".webm"):
+			return "video/webm"
+		case strings.HasSuffix(lower, ".png"):
+			return "image/png"
+		case strings.HasSuffix(lower, ".jpg"), strings.HasSuffix(lower, ".jpeg"):
+			return "image/jpeg"
+		case strings.HasSuffix(lower, ".txt"):
+			return "text/plain; charset=utf-8"
+		case strings.HasSuffix(lower, ".json"):
+			return "application/json"
+		}
+	}
+	if contentType == "" {
+		return "application/octet-stream"
+	}
+	return contentType
+}
+
+func (s *Service) deleteObject(w http.ResponseWriter, r *http.Request) {
+	bucket := chi.URLParam(r, "bucket")
+	key := r.URL.Query().Get("key")
+	_ = s.store.Delete(r.Context(), bucket, key)
+	if err := s.repo.DeleteObject(r.Context(), bucket, key); err != nil {
+		writeJSONError(w, mapStatus(err), err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Service) listStreams(w http.ResponseWriter, r *http.Request) {
+	streams, err := s.repo.ListStreams(r.Context())
+	if err != nil {
+		writeJSONError(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, streams)
+}
+
+func (s *Service) createStream(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Name   string `json:"name"`
+		Bucket string `json:"bucket"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Name == "" || req.Bucket == "" {
+		writeJSONError(w, http.StatusBadRequest, "name and bucket are required")
+		return
+	}
+	stream := types.Stream{ID: "stream-" + randomSessionID()[:12], Name: req.Name, Bucket: req.Bucket, Status: "active", CreatedAt: time.Now().UTC()}
+	if err := s.repo.CreateStream(r.Context(), stream); err != nil {
+		writeJSONError(w, mapStatus(err), err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, stream)
+}
+
+func (s *Service) getStream(w http.ResponseWriter, r *http.Request) {
+	stream, err := s.repo.GetStream(r.Context(), chi.URLParam(r, "id"))
+	if err != nil {
+		writeJSONError(w, mapStatus(err), err.Error())
+		return
+	}
+	segments, _ := s.repo.ListStreamSegments(r.Context(), stream.ID)
+	writeJSON(w, http.StatusOK, map[string]any{"stream": stream, "segments": segments})
+}
+
+func (s *Service) listSegments(w http.ResponseWriter, r *http.Request) {
+	segments, err := s.repo.ListStreamSegments(r.Context(), chi.URLParam(r, "id"))
+	if err != nil {
+		writeJSONError(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, segments)
+}
+
+func (s *Service) playlist(w http.ResponseWriter, r *http.Request) {
+	stream, err := s.repo.GetStream(r.Context(), chi.URLParam(r, "id"))
+	if err != nil {
+		writeJSONError(w, mapStatus(err), err.Error())
+		return
+	}
+	segments, _ := s.repo.ListStreamSegments(r.Context(), stream.ID)
+	var b strings.Builder
+	b.WriteString("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:4\n#EXT-X-MEDIA-SEQUENCE:0\n")
+	for _, seg := range segments {
+		duration := float64(seg.DurationMS) / 1000
+		if duration <= 0 {
+			duration = 4
+		}
+		b.WriteString(fmt.Sprintf("#EXTINF:%.3f,\n/%s/%s\n", duration, stream.Bucket, seg.ObjectKey))
+	}
+	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+	_, _ = w.Write([]byte(b.String()))
+}
+
+func (s *Service) storageHealth(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, s.healthSnapshot(r))
+}
+
+func (s *Service) usageSummary(w http.ResponseWriter, r *http.Request) {
+	usage, err := s.repo.UsageSummary(r.Context())
+	if err != nil {
+		writeJSONError(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, usage)
+}
+
+func (s *Service) auditLogs(w http.ResponseWriter, r *http.Request) {
+	items, err := s.repo.ListAudit(r.Context(), intQuery(r, "limit", 100))
+	if err != nil {
+		writeJSONError(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, items)
+}
+
+func (s *Service) quotas(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{"enabled": false, "message": "operator quotas are disabled by default"})
+}
+
+func (s *Service) saveQuotas(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusAccepted, map[string]any{"enabled": false, "message": "quota persistence is intentionally disabled in this MVP"})
+}
+
+func (s *Service) healthz(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, s.healthSnapshot(r))
+}
+
+func (s *Service) healthSnapshot(r *http.Request) map[string]any {
+	ctx := r.Context()
+	dbErr := s.repo.Health(ctx)
+	redisErr := s.cache.Health(ctx)
+	return map[string]any{
+		"api":      map[string]any{"healthy": true, "message": "ok"},
+		"postgres": healthItem(dbErr),
+		"redis":    healthItem(redisErr),
+		"storage":  s.store.Health(ctx),
+	}
+}
+
+func healthItem(err error) map[string]any {
+	if err != nil {
+		return map[string]any{"healthy": false, "message": err.Error()}
+	}
+	return map[string]any{"healthy": true, "message": "ok"}
+}
+
+func writeJSON(w http.ResponseWriter, status int, value any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(value)
+}
+
+func writeJSONError(w http.ResponseWriter, status int, message string) {
+	writeJSON(w, status, map[string]string{"error": message})
+}
+
+func mapStatus(err error) int {
+	switch {
+	case errors.Is(err, meta.ErrBucketNotFound), errors.Is(err, meta.ErrObjectNotFound), errors.Is(err, meta.ErrStreamNotFound):
+		return http.StatusNotFound
+	case errors.Is(err, meta.ErrBucketExists), errors.Is(err, meta.ErrBucketNotEmpty):
+		return http.StatusConflict
+	default:
+		return http.StatusInternalServerError
+	}
+}
+
+func intQuery(r *http.Request, key string, fallback int) int {
+	value, err := strconv.Atoi(r.URL.Query().Get(key))
+	if err != nil {
+		return fallback
+	}
+	return value
+}
+
+func safeFilename(key string) string {
+	parts := strings.Split(key, "/")
+	return parts[len(parts)-1]
+}
+
+func normalizeBucketPolicy(policy string) string {
+	switch strings.ToLower(strings.TrimSpace(policy)) {
+	case "public":
+		return "public"
+	case "read-only", "readonly":
+		return "read-only"
+	default:
+		return "private"
+	}
+}

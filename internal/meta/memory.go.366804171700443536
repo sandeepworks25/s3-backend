@@ -1,0 +1,521 @@
+package meta
+
+import (
+	"context"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"s3store/backend/internal/types"
+)
+
+type MemoryRepository struct {
+	mu       sync.RWMutex
+	buckets  map[string]types.Bucket
+	objects  map[string]types.Object
+	uploads  map[string]types.MultipartUpload
+	parts    map[string]map[int]types.MultipartPart
+	streams  map[string]types.Stream
+	segments map[string][]types.StreamSegment
+	audit    []AuditLog
+	admins   map[string]AdminUser
+	accessKeys map[string]AccessKey
+}
+
+func NewMemoryRepository() *MemoryRepository {
+	return &MemoryRepository{
+		buckets:  map[string]types.Bucket{},
+		objects:  map[string]types.Object{},
+		uploads:  map[string]types.MultipartUpload{},
+		parts:    map[string]map[int]types.MultipartPart{},
+		streams:  map[string]types.Stream{},
+		segments: map[string][]types.StreamSegment{},
+		admins:   map[string]AdminUser{},
+		accessKeys: map[string]AccessKey{},
+	}
+}
+
+func (r *MemoryRepository) Close() {}
+
+func (r *MemoryRepository) Health(context.Context) error { return nil }
+
+func (r *MemoryRepository) CreateBucket(_ context.Context, name, policy string) (types.Bucket, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.buckets[name]; ok {
+		return types.Bucket{}, ErrBucketExists
+	}
+	if policy == "" {
+		policy = "private"
+	}
+	b := types.Bucket{Name: name, Policy: policy, CreatedAt: time.Now().UTC()}
+	r.buckets[name] = b
+	return b, nil
+}
+
+func (r *MemoryRepository) ListBuckets(context.Context) ([]types.Bucket, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make([]types.Bucket, 0, len(r.buckets))
+	for _, b := range r.buckets {
+		out = append(out, b)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, nil
+}
+
+func (r *MemoryRepository) GetBucket(_ context.Context, name string) (types.Bucket, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	b, ok := r.buckets[name]
+	if !ok {
+		return types.Bucket{}, ErrBucketNotFound
+	}
+	return b, nil
+}
+
+func (r *MemoryRepository) UpdateBucket(_ context.Context, oldName, newName, policy string) (types.Bucket, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	b, ok := r.buckets[oldName]
+	if !ok {
+		return types.Bucket{}, ErrBucketNotFound
+	}
+	if policy == "" {
+		policy = "private"
+	}
+	if oldName == newName {
+		b.Policy = policy
+		r.buckets[oldName] = b
+		return b, nil
+	}
+	if _, ok := r.buckets[newName]; ok {
+		return types.Bucket{}, ErrBucketExists
+	}
+	delete(r.buckets, oldName)
+	b.Name = newName
+	b.Policy = policy
+	r.buckets[newName] = b
+	oldPrefix := oldName + "\x00"
+	for id, obj := range r.objects {
+		if strings.HasPrefix(id, oldPrefix) {
+			delete(r.objects, id)
+			obj.Bucket = newName
+			r.objects[objectID(newName, obj.Key)] = obj
+		}
+	}
+	for id, upload := range r.uploads {
+		if upload.Bucket == oldName {
+			upload.Bucket = newName
+			r.uploads[id] = upload
+		}
+	}
+	for id, stream := range r.streams {
+		if stream.Bucket == oldName {
+			stream.Bucket = newName
+			r.streams[id] = stream
+		}
+	}
+	return b, nil
+}
+
+func (r *MemoryRepository) DeleteBucket(_ context.Context, name string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.buckets[name]; !ok {
+		return ErrBucketNotFound
+	}
+	prefix := name + "\x00"
+	for k := range r.objects {
+		if strings.HasPrefix(k, prefix) {
+			return ErrBucketNotEmpty
+		}
+	}
+	delete(r.buckets, name)
+	return nil
+}
+
+func (r *MemoryRepository) DeleteBucketRecursive(_ context.Context, name string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.buckets[name]; !ok {
+		return ErrBucketNotFound
+	}
+	prefix := name + "\x00"
+	for id := range r.objects {
+		if strings.HasPrefix(id, prefix) {
+			delete(r.objects, id)
+		}
+	}
+	for id, upload := range r.uploads {
+		if upload.Bucket == name {
+			delete(r.uploads, id)
+			delete(r.parts, id)
+		}
+	}
+	for id, stream := range r.streams {
+		if stream.Bucket == name {
+			delete(r.streams, id)
+			delete(r.segments, id)
+		}
+	}
+	delete(r.buckets, name)
+	return nil
+}
+
+func (r *MemoryRepository) UpsertObject(_ context.Context, obj types.Object) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.buckets[obj.Bucket]; !ok {
+		return ErrBucketNotFound
+	}
+	now := time.Now().UTC()
+	if obj.CreatedAt.IsZero() {
+		obj.CreatedAt = now
+	}
+	obj.UpdatedAt = now
+	r.objects[objectID(obj.Bucket, obj.Key)] = obj
+	return nil
+}
+
+func (r *MemoryRepository) GetObject(_ context.Context, bucket, key string) (types.Object, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	obj, ok := r.objects[objectID(bucket, key)]
+	if !ok {
+		return types.Object{}, ErrObjectNotFound
+	}
+	return obj, nil
+}
+
+func (r *MemoryRepository) DeleteObject(_ context.Context, bucket, key string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	id := objectID(bucket, key)
+	if _, ok := r.objects[id]; !ok {
+		return ErrObjectNotFound
+	}
+	delete(r.objects, id)
+	return nil
+}
+
+func (r *MemoryRepository) ListObjects(_ context.Context, bucket, prefix string, limit int, cursor string) ([]types.Object, string, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if _, ok := r.buckets[bucket]; !ok {
+		return nil, "", ErrBucketNotFound
+	}
+	if limit <= 0 || limit > 1000 {
+		limit = 1000
+	}
+	var all []types.Object
+	for _, obj := range r.objects {
+		if obj.Bucket == bucket && strings.HasPrefix(obj.Key, prefix) && obj.Key > cursor {
+			all = append(all, obj)
+		}
+	}
+	sort.Slice(all, func(i, j int) bool { return all[i].Key < all[j].Key })
+	if len(all) <= limit {
+		return all, "", nil
+	}
+	return all[:limit], all[limit-1].Key, nil
+}
+
+func (r *MemoryRepository) CreateMultipartUpload(_ context.Context, upload types.MultipartUpload) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.buckets[upload.Bucket]; !ok {
+		return ErrBucketNotFound
+	}
+	r.uploads[upload.ID] = upload
+	r.parts[upload.ID] = map[int]types.MultipartPart{}
+	return nil
+}
+
+func (r *MemoryRepository) GetMultipartUpload(_ context.Context, uploadID string) (types.MultipartUpload, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	upload, ok := r.uploads[uploadID]
+	if !ok {
+		return types.MultipartUpload{}, ErrUploadNotFound
+	}
+	return upload, nil
+}
+
+func (r *MemoryRepository) SaveMultipartPart(_ context.Context, part types.MultipartPart) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.uploads[part.UploadID]; !ok {
+		return ErrUploadNotFound
+	}
+	if r.parts[part.UploadID] == nil {
+		r.parts[part.UploadID] = map[int]types.MultipartPart{}
+	}
+	r.parts[part.UploadID][part.PartNumber] = part
+	return nil
+}
+
+func (r *MemoryRepository) ListMultipartParts(_ context.Context, uploadID string) ([]types.MultipartPart, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	partsByNumber, ok := r.parts[uploadID]
+	if !ok {
+		return nil, ErrUploadNotFound
+	}
+	parts := make([]types.MultipartPart, 0, len(partsByNumber))
+	for _, p := range partsByNumber {
+		parts = append(parts, p)
+	}
+	sort.Slice(parts, func(i, j int) bool { return parts[i].PartNumber < parts[j].PartNumber })
+	return parts, nil
+}
+
+func (r *MemoryRepository) DeleteMultipartUpload(_ context.Context, uploadID string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.uploads, uploadID)
+	delete(r.parts, uploadID)
+	return nil
+}
+
+func (r *MemoryRepository) CreateStream(_ context.Context, stream types.Stream) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.streams[stream.ID] = stream
+	return nil
+}
+
+func (r *MemoryRepository) ListStreams(context.Context) ([]types.Stream, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make([]types.Stream, 0, len(r.streams))
+	for _, s := range r.streams {
+		out = append(out, s)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
+	return out, nil
+}
+
+func (r *MemoryRepository) GetStream(_ context.Context, id string) (types.Stream, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	s, ok := r.streams[id]
+	if !ok {
+		return types.Stream{}, ErrStreamNotFound
+	}
+	return s, nil
+}
+
+func (r *MemoryRepository) SaveStreamSegment(_ context.Context, segment types.StreamSegment) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.segments[segment.StreamID] = append(r.segments[segment.StreamID], segment)
+	sort.Slice(r.segments[segment.StreamID], func(i, j int) bool {
+		return r.segments[segment.StreamID][i].SequenceNumber < r.segments[segment.StreamID][j].SequenceNumber
+	})
+	return nil
+}
+
+func (r *MemoryRepository) ListStreamSegments(_ context.Context, streamID string) ([]types.StreamSegment, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return append([]types.StreamSegment(nil), r.segments[streamID]...), nil
+}
+
+func (r *MemoryRepository) AddAudit(_ context.Context, actor, action, resource, result string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.audit = append([]AuditLog{{
+		ID:        randomID(),
+		Actor:     actor,
+		Action:    action,
+		Resource:  resource,
+		Result:    result,
+		CreatedAt: time.Now().UTC().Format(time.RFC3339),
+	}}, r.audit...)
+	if len(r.audit) > 500 {
+		r.audit = r.audit[:500]
+	}
+	return nil
+}
+
+func (r *MemoryRepository) ListAudit(_ context.Context, limit int) ([]AuditLog, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if limit <= 0 || limit > 200 {
+		limit = 100
+	}
+	if len(r.audit) < limit {
+		limit = len(r.audit)
+	}
+	return append([]AuditLog(nil), r.audit[:limit]...), nil
+}
+
+func (r *MemoryRepository) UsageSummary(context.Context) (UsageSummary, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var bytes int64
+	for _, obj := range r.objects {
+		bytes += obj.Size
+	}
+	return UsageSummary{
+		BucketCount: len(r.buckets),
+		ObjectCount: len(r.objects),
+		TotalBytes:  bytes,
+		StreamCount: len(r.streams),
+	}, nil
+}
+
+func (r *MemoryRepository) UpsertAdminUser(_ context.Context, user AdminUser) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	now := time.Now().UTC().Format(time.RFC3339)
+	if existing, ok := r.admins[user.Email]; ok {
+		if user.ID == "" {
+			user.ID = existing.ID
+		}
+		user.CreatedAt = existing.CreatedAt
+	} else {
+		if user.ID == "" {
+			user.ID = randomID()
+		}
+		user.CreatedAt = now
+	}
+	if user.Name == "" {
+		user.Name = user.Email
+	}
+	if user.Role == "" {
+		user.Role = "root"
+	}
+	if user.Status == "" {
+		user.Status = "Active"
+	}
+	user.UpdatedAt = now
+	r.admins[user.Email] = user
+	return nil
+}
+
+func (r *MemoryRepository) GetAdminUserByEmail(_ context.Context, email string) (AdminUser, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	user, ok := r.admins[email]
+	if !ok {
+		return AdminUser{}, ErrAdminNotFound
+	}
+	return user, nil
+}
+
+func (r *MemoryRepository) ListAdminUsers(_ context.Context) ([]AdminUser, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	users := make([]AdminUser, 0, len(r.admins))
+	for _, user := range r.admins {
+		users = append(users, user)
+	}
+	sort.Slice(users, func(i, j int) bool { return users[i].Email < users[j].Email })
+	return users, nil
+}
+
+func (r *MemoryRepository) DeleteAdminUser(_ context.Context, email string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.admins[email]; !ok {
+		return ErrAdminNotFound
+	}
+	delete(r.admins, email)
+	for id, key := range r.accessKeys {
+		if key.OwnerEmail == email {
+			delete(r.accessKeys, id)
+		}
+	}
+	return nil
+}
+
+func (r *MemoryRepository) UpsertAccessKey(_ context.Context, key AccessKey) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	now := time.Now().UTC().Format(time.RFC3339)
+	if key.ID == "" {
+		key.ID = randomID()
+	}
+	if existing, ok := r.accessKeys[key.ID]; ok {
+		key.CreatedAt = existing.CreatedAt
+		if key.SecretKey == "" {
+			key.SecretKey = existing.SecretKey
+		}
+		if key.AccessKeyID == "" {
+			key.AccessKeyID = existing.AccessKeyID
+		}
+		key.LastUsed = existing.LastUsed
+	} else {
+		key.CreatedAt = now
+	}
+	if key.Status == "" {
+		key.Status = "Active"
+	}
+	key.UpdatedAt = now
+	r.accessKeys[key.ID] = key
+	return nil
+}
+
+func (r *MemoryRepository) ListAccessKeys(_ context.Context) ([]AccessKey, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	keys := make([]AccessKey, 0, len(r.accessKeys))
+	for _, key := range r.accessKeys {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool { return keys[i].CreatedAt > keys[j].CreatedAt })
+	return keys, nil
+}
+
+func (r *MemoryRepository) GetAccessKey(_ context.Context, id string) (AccessKey, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	key, ok := r.accessKeys[id]
+	if !ok {
+		return AccessKey{}, ErrAccessKeyNotFound
+	}
+	return key, nil
+}
+
+func (r *MemoryRepository) GetAccessKeyByAccessKeyID(_ context.Context, accessKeyID string) (AccessKey, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, key := range r.accessKeys {
+		if key.AccessKeyID == accessKeyID {
+			return key, nil
+		}
+	}
+	return AccessKey{}, ErrAccessKeyNotFound
+}
+
+func (r *MemoryRepository) DeleteAccessKey(_ context.Context, id string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.accessKeys[id]; !ok {
+		return ErrAccessKeyNotFound
+	}
+	delete(r.accessKeys, id)
+	return nil
+}
+
+func (r *MemoryRepository) TouchAccessKey(_ context.Context, accessKeyID string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	now := time.Now().UTC().Format(time.RFC3339)
+	for id, key := range r.accessKeys {
+		if key.AccessKeyID == accessKeyID {
+			key.LastUsed = now
+			key.UpdatedAt = now
+			r.accessKeys[id] = key
+			return nil
+		}
+	}
+	return ErrAccessKeyNotFound
+}
+
+func objectID(bucket, key string) string {
+	return bucket + "\x00" + key
+}

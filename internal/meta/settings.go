@@ -1,0 +1,37 @@
+package meta
+
+func defaultSystemSettings() SystemSettings {
+	return SystemSettings{
+		OrganizationName: "S3Store",
+		PublicBaseURL:    "http://localhost:9001",
+		SessionTTLHours:  24,
+		MaxUploadMB:      1024,
+		SSOEnabled:       false,
+		EncryptionAtRest: true,
+		MFARequired:      false,
+		LifecycleRules:   false,
+		RetentionLocks:   true,
+		Versioning:       false,
+		WebhooksEnabled:  false,
+		TeamRoles:        true,
+	}
+}
+
+func normalizeSystemSettings(settings SystemSettings) SystemSettings {
+	if settings.OrganizationName == "" {
+		settings.OrganizationName = "S3Store"
+	}
+	if settings.PublicBaseURL == "" {
+		settings.PublicBaseURL = "http://localhost:9001"
+	}
+	if settings.SessionTTLHours <= 0 {
+		settings.SessionTTLHours = 24
+	}
+	if settings.SessionTTLHours > 720 {
+		settings.SessionTTLHours = 720
+	}
+	if settings.MaxUploadMB <= 0 {
+		settings.MaxUploadMB = 1024
+	}
+	return settings
+}

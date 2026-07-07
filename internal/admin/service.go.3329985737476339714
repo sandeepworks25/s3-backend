@@ -1,0 +1,419 @@
+package admin
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+	"golang.org/x/crypto/bcrypt"
+
+	"s3store/backend/internal/config"
+	"s3store/backend/internal/meta"
+	"s3store/backend/internal/redisx"
+	"s3store/backend/internal/storage"
+	"s3store/backend/internal/types"
+)
+
+type Service struct {
+	repo         meta.Repository
+	store        storage.Backend
+	cache        *redisx.Client
+	cfg          config.Config
+	logger       *slog.Logger
+}
+
+func NewService(repo meta.Repository, store storage.Backend, cache *redisx.Client, cfg config.Config, logger *slog.Logger) *Service {
+	return &Service{repo: repo, store: store, cache: cache, cfg: cfg, logger: logger}
+}
+
+func (s *Service) SeedRootAdmin(ctx context.Context) error {
+	if strings.TrimSpace(s.cfg.RootAdminEmail) == "" || s.cfg.RootAdminPassword == "" {
+		return errors.New("ROOT_ADMIN_EMAIL and ROOT_ADMIN_PASSWORD are required")
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(s.cfg.RootAdminPassword), bcrypt.DefaultCost)
+	if err != nil {
+		return err
+	}
+	if err := s.repo.UpsertAdminUser(ctx, meta.AdminUser{
+		Email:        strings.TrimSpace(s.cfg.RootAdminEmail),
+		PasswordHash: string(hash),
+		Role:         "root",
+	}); err != nil {
+		return err
+	}
+	_ = s.repo.AddAudit(ctx, s.cfg.RootAdminEmail, "SeedAdmin", "admin", "success")
+	s.logger.Info("root admin seeded", "email", s.cfg.RootAdminEmail)
+	return nil
+}
+
+func (s *Service) Router() http.Handler {
+	r := chi.NewRouter()
+	r.Use(cors)
+	r.Get("/healthz", s.healthz)
+	r.Route("/api", func(r chi.Router) {
+		r.Post("/auth/login", s.login)
+		r.Post("/auth/logout", s.logout)
+		r.Group(func(r chi.Router) {
+			r.Use(s.requireSession)
+			r.Get("/auth/me", s.me)
+			r.Get("/dashboard", s.dashboard)
+			r.Get("/buckets", s.listBuckets)
+			r.Post("/buckets", s.createBucket)
+			r.Delete("/buckets/{bucket}", s.deleteBucket)
+			r.Get("/buckets/{bucket}/objects", s.listObjects)
+			r.Post("/buckets/{bucket}/objects/upload", s.uploadObject)
+			r.Get("/buckets/{bucket}/objects/download", s.downloadObject)
+			r.Delete("/buckets/{bucket}/objects", s.deleteObject)
+			r.Get("/streams", s.listStreams)
+			r.Post("/streams", s.createStream)
+			r.Get("/streams/{id}", s.getStream)
+			r.Get("/streams/{id}/segments", s.listSegments)
+			r.Get("/streams/{id}/playlist.m3u8", s.playlist)
+			r.Get("/storage/health", s.storageHealth)
+			r.Get("/usage/summary", s.usageSummary)
+			r.Get("/audit-logs", s.auditLogs)
+			r.Get("/quotas", s.quotas)
+			r.Put("/quotas", s.saveQuotas)
+		})
+	})
+	return r
+}
+
+func cors(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+		if origin != "" {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Vary", "Origin")
+			w.Header().Set("Access-Control-Allow-Credentials", "true")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+			w.Header().Set("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS")
+		}
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (s *Service) login(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Email    string `json:"email"`
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	req.Email = strings.TrimSpace(req.Email)
+	user, err := s.repo.GetAdminUserByEmail(r.Context(), req.Email)
+	if err != nil || bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(req.Password)) != nil {
+		writeJSONError(w, http.StatusUnauthorized, "invalid email or password")
+		return
+	}
+	sessionID := randomSessionID()
+	s.cache.Set(r.Context(), "session:"+sessionID, user.Email, 24*time.Hour)
+	http.SetCookie(w, &http.Cookie{Name: "s3store_session", Value: sessionID, Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode, MaxAge: 86400})
+	_ = s.repo.AddAudit(r.Context(), user.Email, "Login", "admin", "success")
+	writeJSON(w, http.StatusOK, map[string]any{"email": user.Email, "role": user.Role})
+}
+
+func (s *Service) logout(w http.ResponseWriter, r *http.Request) {
+	if c, err := r.Cookie("s3store_session"); err == nil {
+		s.cache.Del(r.Context(), "session:"+c.Value)
+	}
+	http.SetCookie(w, &http.Cookie{Name: "s3store_session", Value: "", Path: "/", HttpOnly: true, MaxAge: -1})
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Service) requireSession(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := r.Cookie("s3store_session")
+		if err != nil || c.Value == "" {
+			writeJSONError(w, http.StatusUnauthorized, "login required")
+			return
+		}
+		if _, ok := s.cache.Get(r.Context(), "session:"+c.Value); !ok {
+			writeJSONError(w, http.StatusUnauthorized, "session expired")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (s *Service) me(w http.ResponseWriter, r *http.Request) {
+	c, _ := r.Cookie("s3store_session")
+	email, _ := s.cache.Get(r.Context(), "session:"+c.Value)
+	user, err := s.repo.GetAdminUserByEmail(r.Context(), email)
+	if err != nil {
+		writeJSONError(w, http.StatusUnauthorized, "session user not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"email": user.Email, "role": user.Role})
+}
+
+func (s *Service) dashboard(w http.ResponseWriter, r *http.Request) {
+	usage, _ := s.repo.UsageSummary(r.Context())
+	health := s.healthSnapshot(r)
+	audit, _ := s.repo.ListAudit(r.Context(), 8)
+	writeJSON(w, http.StatusOK, map[string]any{"usage": usage, "health": health, "audit": audit})
+}
+
+func (s *Service) listBuckets(w http.ResponseWriter, r *http.Request) {
+	buckets, err := s.repo.ListBuckets(r.Context())
+	if err != nil {
+		writeJSONError(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, buckets)
+}
+
+func (s *Service) createBucket(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Name == "" {
+		writeJSONError(w, http.StatusBadRequest, "bucket name is required")
+		return
+	}
+	b, err := s.repo.CreateBucket(r.Context(), req.Name)
+	if err != nil {
+		writeJSONError(w, mapStatus(err), err.Error())
+		return
+	}
+	_ = s.repo.AddAudit(r.Context(), "admin", "CreateBucket", req.Name, "success")
+	writeJSON(w, http.StatusCreated, b)
+}
+
+func (s *Service) deleteBucket(w http.ResponseWriter, r *http.Request) {
+	bucket := chi.URLParam(r, "bucket")
+	if err := s.repo.DeleteBucket(r.Context(), bucket); err != nil {
+		writeJSONError(w, mapStatus(err), err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Service) listObjects(w http.ResponseWriter, r *http.Request) {
+	bucket := chi.URLParam(r, "bucket")
+	prefix := r.URL.Query().Get("prefix")
+	cursor := r.URL.Query().Get("cursor")
+	limit := intQuery(r, "limit", 100)
+	objects, next, err := s.repo.ListObjects(r.Context(), bucket, prefix, limit, cursor)
+	if err != nil {
+		writeJSONError(w, mapStatus(err), err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": objects, "nextCursor": next})
+}
+
+func (s *Service) uploadObject(w http.ResponseWriter, r *http.Request) {
+	bucket := chi.URLParam(r, "bucket")
+	key := r.URL.Query().Get("key")
+	if key == "" {
+		writeJSONError(w, http.StatusBadRequest, "key is required")
+		return
+	}
+	stored, err := s.store.Put(r.Context(), storage.ObjectWrite{Bucket: bucket, Key: key, ContentType: r.Header.Get("Content-Type"), Body: r.Body})
+	if err != nil {
+		writeJSONError(w, 500, err.Error())
+		return
+	}
+	obj := types.Object{Bucket: bucket, Key: key, Size: stored.Size, ETag: stored.ETag, ContentType: stored.ContentType, StorageBackend: stored.StorageBackend, PhysicalPath: stored.PhysicalPath}
+	if err := s.repo.UpsertObject(r.Context(), obj); err != nil {
+		writeJSONError(w, mapStatus(err), err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, obj)
+}
+
+func (s *Service) downloadObject(w http.ResponseWriter, r *http.Request) {
+	bucket := chi.URLParam(r, "bucket")
+	key := r.URL.Query().Get("key")
+	obj, err := s.repo.GetObject(r.Context(), bucket, key)
+	if err != nil {
+		writeJSONError(w, mapStatus(err), err.Error())
+		return
+	}
+	reader, _, err := s.store.Get(r.Context(), bucket, key, nil)
+	if err != nil {
+		writeJSONError(w, 404, err.Error())
+		return
+	}
+	defer reader.Close()
+	w.Header().Set("Content-Type", obj.ContentType)
+	w.Header().Set("Content-Length", strconv.FormatInt(obj.Size, 10))
+	w.Header().Set("Content-Disposition", `attachment; filename="`+safeFilename(key)+`"`)
+	_, _ = io.Copy(w, reader)
+}
+
+func (s *Service) deleteObject(w http.ResponseWriter, r *http.Request) {
+	bucket := chi.URLParam(r, "bucket")
+	key := r.URL.Query().Get("key")
+	_ = s.store.Delete(r.Context(), bucket, key)
+	if err := s.repo.DeleteObject(r.Context(), bucket, key); err != nil {
+		writeJSONError(w, mapStatus(err), err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Service) listStreams(w http.ResponseWriter, r *http.Request) {
+	streams, err := s.repo.ListStreams(r.Context())
+	if err != nil {
+		writeJSONError(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, streams)
+}
+
+func (s *Service) createStream(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Name   string `json:"name"`
+		Bucket string `json:"bucket"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Name == "" || req.Bucket == "" {
+		writeJSONError(w, http.StatusBadRequest, "name and bucket are required")
+		return
+	}
+	stream := types.Stream{ID: "stream-" + randomSessionID()[:12], Name: req.Name, Bucket: req.Bucket, Status: "active", CreatedAt: time.Now().UTC()}
+	if err := s.repo.CreateStream(r.Context(), stream); err != nil {
+		writeJSONError(w, mapStatus(err), err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, stream)
+}
+
+func (s *Service) getStream(w http.ResponseWriter, r *http.Request) {
+	stream, err := s.repo.GetStream(r.Context(), chi.URLParam(r, "id"))
+	if err != nil {
+		writeJSONError(w, mapStatus(err), err.Error())
+		return
+	}
+	segments, _ := s.repo.ListStreamSegments(r.Context(), stream.ID)
+	writeJSON(w, http.StatusOK, map[string]any{"stream": stream, "segments": segments})
+}
+
+func (s *Service) listSegments(w http.ResponseWriter, r *http.Request) {
+	segments, err := s.repo.ListStreamSegments(r.Context(), chi.URLParam(r, "id"))
+	if err != nil {
+		writeJSONError(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, segments)
+}
+
+func (s *Service) playlist(w http.ResponseWriter, r *http.Request) {
+	stream, err := s.repo.GetStream(r.Context(), chi.URLParam(r, "id"))
+	if err != nil {
+		writeJSONError(w, mapStatus(err), err.Error())
+		return
+	}
+	segments, _ := s.repo.ListStreamSegments(r.Context(), stream.ID)
+	var b strings.Builder
+	b.WriteString("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:4\n#EXT-X-MEDIA-SEQUENCE:0\n")
+	for _, seg := range segments {
+		duration := float64(seg.DurationMS) / 1000
+		if duration <= 0 {
+			duration = 4
+		}
+		b.WriteString(fmt.Sprintf("#EXTINF:%.3f,\n/%s/%s\n", duration, stream.Bucket, seg.ObjectKey))
+	}
+	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+	_, _ = w.Write([]byte(b.String()))
+}
+
+func (s *Service) storageHealth(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, s.healthSnapshot(r))
+}
+
+func (s *Service) usageSummary(w http.ResponseWriter, r *http.Request) {
+	usage, err := s.repo.UsageSummary(r.Context())
+	if err != nil {
+		writeJSONError(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, usage)
+}
+
+func (s *Service) auditLogs(w http.ResponseWriter, r *http.Request) {
+	items, err := s.repo.ListAudit(r.Context(), intQuery(r, "limit", 100))
+	if err != nil {
+		writeJSONError(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, items)
+}
+
+func (s *Service) quotas(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{"enabled": false, "message": "operator quotas are disabled by default"})
+}
+
+func (s *Service) saveQuotas(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusAccepted, map[string]any{"enabled": false, "message": "quota persistence is intentionally disabled in this MVP"})
+}
+
+func (s *Service) healthz(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, s.healthSnapshot(r))
+}
+
+func (s *Service) healthSnapshot(r *http.Request) map[string]any {
+	ctx := r.Context()
+	dbErr := s.repo.Health(ctx)
+	redisErr := s.cache.Health(ctx)
+	return map[string]any{
+		"api":      map[string]any{"healthy": true, "message": "ok"},
+		"postgres": healthItem(dbErr),
+		"redis":    healthItem(redisErr),
+		"storage":  s.store.Health(ctx),
+	}
+}
+
+func healthItem(err error) map[string]any {
+	if err != nil {
+		return map[string]any{"healthy": false, "message": err.Error()}
+	}
+	return map[string]any{"healthy": true, "message": "ok"}
+}
+
+func writeJSON(w http.ResponseWriter, status int, value any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(value)
+}
+
+func writeJSONError(w http.ResponseWriter, status int, message string) {
+	writeJSON(w, status, map[string]string{"error": message})
+}
+
+func mapStatus(err error) int {
+	switch {
+	case errors.Is(err, meta.ErrBucketNotFound), errors.Is(err, meta.ErrObjectNotFound), errors.Is(err, meta.ErrStreamNotFound):
+		return http.StatusNotFound
+	case errors.Is(err, meta.ErrBucketExists), errors.Is(err, meta.ErrBucketNotEmpty):
+		return http.StatusConflict
+	default:
+		return http.StatusInternalServerError
+	}
+}
+
+func intQuery(r *http.Request, key string, fallback int) int {
+	value, err := strconv.Atoi(r.URL.Query().Get(key))
+	if err != nil {
+		return fallback
+	}
+	return value
+}
+
+func safeFilename(key string) string {
+	parts := strings.Split(key, "/")
+	return parts[len(parts)-1]
+}

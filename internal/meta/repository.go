@@ -1,0 +1,148 @@
+package meta
+
+import (
+	"context"
+	"errors"
+
+	"s3store/backend/internal/types"
+)
+
+var (
+	ErrBucketExists      = errors.New("bucket already exists")
+	ErrBucketNotFound    = errors.New("bucket not found")
+	ErrBucketNotEmpty    = errors.New("bucket not empty")
+	ErrObjectNotFound    = errors.New("object not found")
+	ErrUploadNotFound    = errors.New("multipart upload not found")
+	ErrInvalidPart       = errors.New("invalid multipart part")
+	ErrStreamNotFound    = errors.New("stream not found")
+	ErrAdminNotFound     = errors.New("admin user not found")
+	ErrAccessKeyNotFound = errors.New("access key not found")
+)
+
+type Repository interface {
+	Close()
+	Health(ctx context.Context) error
+
+	CreateBucket(ctx context.Context, name, policy string) (types.Bucket, error)
+	ListBuckets(ctx context.Context) ([]types.Bucket, error)
+	GetBucket(ctx context.Context, name string) (types.Bucket, error)
+	UpdateBucket(ctx context.Context, oldName, newName, policy string) (types.Bucket, error)
+	DeleteBucket(ctx context.Context, name string) error
+	DeleteBucketRecursive(ctx context.Context, name string) error
+
+	UpsertObject(ctx context.Context, obj types.Object) error
+	GetObject(ctx context.Context, bucket, key string) (types.Object, error)
+	DeleteObject(ctx context.Context, bucket, key string) error
+	ListObjects(ctx context.Context, bucket, prefix string, limit int, cursor string) ([]types.Object, string, error)
+
+	CreateMultipartUpload(ctx context.Context, upload types.MultipartUpload) error
+	GetMultipartUpload(ctx context.Context, uploadID string) (types.MultipartUpload, error)
+	SaveMultipartPart(ctx context.Context, part types.MultipartPart) error
+	ListMultipartParts(ctx context.Context, uploadID string) ([]types.MultipartPart, error)
+	DeleteMultipartUpload(ctx context.Context, uploadID string) error
+
+	CreateStream(ctx context.Context, stream types.Stream) error
+	ListStreams(ctx context.Context) ([]types.Stream, error)
+	GetStream(ctx context.Context, id string) (types.Stream, error)
+	SaveStreamSegment(ctx context.Context, segment types.StreamSegment) error
+	ListStreamSegments(ctx context.Context, streamID string) ([]types.StreamSegment, error)
+
+	AddAudit(ctx context.Context, actor, action, resource, result string) error
+	ListAudit(ctx context.Context, limit int) ([]AuditLog, error)
+	UsageSummary(ctx context.Context) (UsageSummary, error)
+
+	UpsertAdminUser(ctx context.Context, user AdminUser) error
+	GetAdminUserByEmail(ctx context.Context, email string) (AdminUser, error)
+	ListAdminUsers(ctx context.Context) ([]AdminUser, error)
+	DeleteAdminUser(ctx context.Context, email string) error
+
+	UpsertAccessKey(ctx context.Context, key AccessKey) error
+	ListAccessKeys(ctx context.Context) ([]AccessKey, error)
+	GetAccessKey(ctx context.Context, id string) (AccessKey, error)
+	GetAccessKeyByAccessKeyID(ctx context.Context, accessKeyID string) (AccessKey, error)
+	DeleteAccessKey(ctx context.Context, id string) error
+	TouchAccessKey(ctx context.Context, accessKeyID string) error
+
+	CreatePolicy(ctx context.Context, policy Policy) (Policy, error)
+	ListPolicies(ctx context.Context) ([]Policy, error)
+	GetPolicy(ctx context.Context, id string) (Policy, error)
+	UpdatePolicy(ctx context.Context, policy Policy) (Policy, error)
+	DeletePolicy(ctx context.Context, id string) error
+
+	GetSystemSettings(ctx context.Context) (SystemSettings, error)
+	SaveSystemSettings(ctx context.Context, settings SystemSettings) (SystemSettings, error)
+}
+
+type AuditLog struct {
+	ID        string `json:"id"`
+	Actor     string `json:"actor"`
+	Action    string `json:"action"`
+	Resource  string `json:"resource"`
+	Result    string `json:"result"`
+	CreatedAt string `json:"createdAt"`
+}
+
+type UsageSummary struct {
+	BucketCount int   `json:"bucketCount"`
+	ObjectCount int   `json:"objectCount"`
+	TotalBytes  int64 `json:"totalBytes"`
+	StreamCount int   `json:"streamCount"`
+}
+
+type AdminUser struct {
+	ID           string `json:"id"`
+	Name         string `json:"name"`
+	Email        string `json:"email"`
+	PasswordHash string `json:"-"`
+	Role         string `json:"role"`
+	Status       string `json:"status"`
+	LastSeen     string `json:"lastSeen"`
+	CreatedAt    string `json:"createdAt"`
+	UpdatedAt    string `json:"updatedAt"`
+}
+
+type AccessKey struct {
+	ID          string   `json:"id"`
+	Label       string   `json:"label"`
+	AccessKeyID string   `json:"accessKeyId"`
+	SecretKey   string   `json:"-"`
+	OwnerEmail  string   `json:"ownerEmail"`
+	Permissions []string `json:"permissions"`
+	Status      string   `json:"status"`
+	LastUsed    string   `json:"lastUsed"`
+	CreatedAt   string   `json:"createdAt"`
+	UpdatedAt   string   `json:"updatedAt"`
+}
+
+type Policy struct {
+	ID          string         `json:"id"`
+	Name        string         `json:"name"`
+	Description string         `json:"description"`
+	Effect      string         `json:"effect"`
+	Actions     []string       `json:"actions"`
+	Resource    string         `json:"resource"`
+	Document    map[string]any `json:"document"`
+	CreatedAt   string         `json:"createdAt"`
+	UpdatedAt   string         `json:"updatedAt"`
+}
+
+type SystemSettings struct {
+	OrganizationName  string `json:"organizationName"`
+	PublicBaseURL     string `json:"publicBaseUrl"`
+	SessionTTLHours   int    `json:"sessionTtlHours"`
+	MaxUploadMB       int    `json:"maxUploadMb"`
+	WebhookEndpoint   string `json:"webhookEndpoint"`
+	SSOEnabled        bool   `json:"ssoEnabled"`
+	EncryptionAtRest  bool   `json:"encryptionAtRest"`
+	MFARequired       bool   `json:"mfaRequired"`
+	LifecycleRules    bool   `json:"lifecycleRules"`
+	RetentionLocks    bool   `json:"retentionLocks"`
+	Versioning        bool   `json:"versioning"`
+	WebhooksEnabled   bool   `json:"webhooksEnabled"`
+	TeamRoles         bool   `json:"teamRoles"`
+	ObjectDataRoot    string `json:"objectDataRoot,omitempty"`
+	MultipartDataRoot string `json:"multipartDataRoot,omitempty"`
+	NASDataRoot       string `json:"nasDataRoot,omitempty"`
+	NASConfigured     bool   `json:"nasConfigured"`
+	UpdatedAt         string `json:"updatedAt"`
+}
