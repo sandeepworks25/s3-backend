@@ -28,8 +28,13 @@ func main() {
 
 	repo, err := meta.OpenPostgres(ctx, cfg.DatabaseURL, logger)
 	if err != nil {
-		logger.Warn("postgres unavailable, using in-memory metadata repository", "error", err)
-		repo = meta.NewMemoryRepository()
+		if cfg.DatabaseURL == "" {
+			logger.Warn("DATABASE_URL is empty, using in-memory metadata repository", "error", err)
+			repo = meta.NewMemoryRepository()
+		} else {
+			logger.Error("postgres unavailable", "error", err)
+			os.Exit(1)
+		}
 	}
 	defer repo.Close()
 

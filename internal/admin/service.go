@@ -83,15 +83,29 @@ func (s *Service) Router() http.Handler {
 		r.Group(func(r chi.Router) {
 			r.Use(s.requireSession)
 			r.Get("/auth/me", s.me)
-			r.Get("/dashboard", s.dashboard)
+
 			r.Get("/buckets", s.listBuckets)
+			r.Get("/buckets/{bucket}/objects", s.listObjects)
+			r.Get("/buckets/{bucket}/objects/download", s.downloadObject)
+		})
+		r.Group(func(r chi.Router) {
+			r.Use(s.requireSession)
+			r.Use(s.requireRoles("Admin", "Operator"))
 			r.Post("/buckets", s.createBucket)
 			r.Put("/buckets/{bucket}", s.renameBucket)
 			r.Delete("/buckets/{bucket}", s.deleteBucket)
-			r.Get("/buckets/{bucket}/objects", s.listObjects)
 			r.Post("/buckets/{bucket}/objects/upload", s.uploadObject)
-			r.Get("/buckets/{bucket}/objects/download", s.downloadObject)
 			r.Delete("/buckets/{bucket}/objects", s.deleteObject)
+			r.Get("/users", s.listUsersAndAccessKeys)
+			r.Post("/access-keys", s.createAccessKey)
+			r.Put("/access-keys/{id}", s.updateAccessKey)
+			r.Post("/access-keys/{id}/rotate", s.rotateAccessKey)
+			r.Delete("/access-keys/{id}", s.deleteAccessKey)
+		})
+		r.Group(func(r chi.Router) {
+			r.Use(s.requireSession)
+			r.Use(s.requireRoles("Admin"))
+			r.Get("/dashboard", s.dashboard)
 			r.Get("/streams", s.listStreams)
 			r.Post("/streams", s.createStream)
 			r.Get("/streams/{id}", s.getStream)
@@ -106,14 +120,9 @@ func (s *Service) Router() http.Handler {
 			r.Post("/policies", s.createPolicy)
 			r.Put("/policies/{id}", s.updatePolicy)
 			r.Delete("/policies/{id}", s.deletePolicy)
-			r.Get("/users", s.listUsersAndAccessKeys)
 			r.Post("/users", s.createUser)
 			r.Put("/users/{email}", s.updateUser)
 			r.Delete("/users/{email}", s.deleteUser)
-			r.Post("/access-keys", s.createAccessKey)
-			r.Put("/access-keys/{id}", s.updateAccessKey)
-			r.Post("/access-keys/{id}/rotate", s.rotateAccessKey)
-			r.Delete("/access-keys/{id}", s.deleteAccessKey)
 			r.Get("/quotas", s.quotas)
 			r.Put("/quotas", s.saveQuotas)
 		})
@@ -194,6 +203,28 @@ func (s *Service) requireSession(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+func (s *Service) requireRoles(roles ...string) func(http.Handler) http.Handler {
+	allowed := map[string]bool{}
+	for _, role := range roles {
+		allowed[normalizeRole(role)] = true
+	}
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			email := sessionEmail(r, s.cache)
+			user, err := s.repo.GetAdminUserByEmail(r.Context(), email)
+			if err != nil {
+				writeJSONError(w, http.StatusUnauthorized, "session user not found")
+				return
+			}
+			if !allowed[normalizeRole(user.Role)] {
+				writeJSONError(w, http.StatusForbidden, "permission denied")
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
 }
 
 func (s *Service) me(w http.ResponseWriter, r *http.Request) {
